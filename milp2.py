@@ -18,6 +18,22 @@ def save_solution(path, m, tr_ops, tr_op_sucs, x, y, t):
         with open(path, "w") as f:
             json.dump(sol, f)
 
+def save_displib_solution(path, m, trains, y, t, u):
+    events = []
+    for tr in range(len(trains)):
+        op = 0
+        while True:
+            events.append((round(t[(tr, op)].X), round(u[(tr, op)].X), tr, op))
+            nxt = [suc for suc in trains[tr][op]['sucs'] if y[(tr, op, suc)].X > 0.5]
+            if not nxt:
+                break
+            op = nxt[0]
+    events.sort()
+    sol = {"objective_value": round(m.ObjVal),
+           "events": [{"time": tm, "train": tr, "operation": op} for (tm, _, tr, op) in events]}
+    with open(path, "w") as f:
+        json.dump(sol, f)
+
 def get_all_edges(tr_op, trains):
     tr_op_suc = []
     for tr_op_val in tr_op:
@@ -34,37 +50,28 @@ def get_prev_ops(tr_ops, tr_op_sucs):
         prev_ops[(tr, suc)].append(op)
     return prev_ops
 
+# [AI] C: horizon = latest start_lb + all durations + all release times (+1): enough time to run
+# every train one after another, so an optimal schedule fits inside it. All t get UB = horizon.
+# M must cover "latest possible time + release (or duration) - earliest possible time (>= 0)",
+# so M = horizon + max release + max duration.
 def get_big_m(trains):
-    max_lb, max_release_time, min_duration_sum = 0, 0, 0
+    max_lb, max_release_time, max_duration = 0, 0, 0
+    duration_sum, release_sum = 0, 0
     for ops in trains:
         for op in ops:
             max_lb = max(op['lb'], max_lb)
-            min_duration_sum += op['min_duration']
+            duration_sum += op['min_duration']
+            max_duration = max(max_duration, op['min_duration'])
             for res_time in op['res'].values():
+                release_sum += res_time
                 max_release_time = max(max_release_time, res_time)
-    return max_lb + len(trains) * max_release_time + min_duration_sum
+    horizon = max_lb + duration_sum + release_sum + 1
+    return horizon, horizon + max_release_time + max_duration
 
 
-
-# the list of pairs of 2 train operations which share same resource 
-def get_resource_ops(trains):
-    resource_tr_ops = {}
-    z = set()
-    res_ops = set()
-    for train_id, train in enumerate(trains):
-        for op_id, op in enumerate(train):
-            for r_name in op['res']:
-                resource_tr_ops.setdefault(r_name, []).append((train_id, op_id))
-    for res, lst in resource_tr_ops.items():
-        for (tr1, op1) in lst:
-            for (tr2, op2) in lst:
-                if tr1 < tr2:
-                    z.add((tr1, op1, tr2, op2))
-                    z.add((tr2, op2, tr1, op1))
-                    res_ops.add((tr1, op1, tr2, op2))
-    return sorted(z), res_ops
-
-def detect_conflicts(tr_op_sucs, y, trains, t):
+# [AI] A: strict=False -> pairs that overlap OR touch (need an order, used to add constraints)
+#         strict=True  -> pairs that really overlap (a pair already in the model must never do this)
+def detect_conflicts(tr_op_sucs, y, trains, t, strict=False):
     res_set = {}
     for (tr, op1, op2) in tr_op_sucs:
         if y[(tr, op1, op2)].X >= 0.5:
@@ -76,7 +83,11 @@ def detect_conflicts(tr_op_sucs, y, trains, t):
     for res_list in res_set.values():
         for (tr1, op1, st1, ed1) in res_list:
             for (tr2, op2, st2, ed2) in res_list:
-                if tr1 < tr2 and st1 < ed2 and st2 < ed1:
+                if strict:
+                    hit = st1 < ed2 and st2 < ed1
+                else:
+                    hit = st1 <= ed2 and st2 <= ed1
+                if tr1 < tr2 and hit:
                     z_container.add((tr1, op1, tr2, op2))
     return sorted(z_container)
 
@@ -87,16 +98,18 @@ def add_resource_constraints(conflicts, trains, m, t, x, z, u, M_u, M, tr_op_suc
         ops1 = trains[tr1][op1]
         ops2 = trains[tr2][op2]
         shared_res = ops1['res'].keys() & ops2['res'].keys()
+        # [AI] B: the extra term "+ M * (1 - y[edge])" switches a constraint off when the train
+        # does not leave op1 towards this successor (an unused branch must not push any time)
         for res_id in shared_res:
             for op_suc1 in ops1['sucs']:
-                m.addConstr(t[(tr1, op_suc1)] + ops1['res'][res_id] <= t[(tr2, op2)] + M * (1 - z[(tr1, op1, tr2, op2)]))  # + 1 - y[(tr1, op1, op_suc1)] + 
+                m.addConstr(t[(tr1, op_suc1)] + ops1['res'][res_id] <= t[(tr2, op2)] + M * (1 - z[(tr1, op1, tr2, op2)]) + M * (1 - y[(tr1, op1, op_suc1)]))
             for op_suc2 in ops2['sucs']:
-                m.addConstr(t[(tr2, op_suc2)] + ops2['res'][res_id] <= t[(tr1, op1)] + M * (1 - z[(tr2, op2, tr1, op1)]))  # 1 - y[(tr2, op2, op_suc2)]
+                m.addConstr(t[(tr2, op_suc2)] + ops2['res'][res_id] <= t[(tr1, op1)] + M * (1 - z[(tr2, op2, tr1, op1)]) + M * (1 - y[(tr2, op2, op_suc2)]))
 
         for op_suc1 in ops1['sucs']:
-            m.addConstr(u[(tr1, op_suc1)] + 1 <= u[(tr2, op2)] + M_u * (1 - z[(tr1, op1, tr2, op2)]))
+            m.addConstr(u[(tr1, op_suc1)] + 1 <= u[(tr2, op2)] + M_u * (1 - z[(tr1, op1, tr2, op2)]) + M_u * (1 - y[(tr1, op1, op_suc1)]))
         for op_suc2 in ops2['sucs']:
-            m.addConstr(u[(tr2, op_suc2)] + 1 <= u[(tr1, op1)] + M_u * (1 - z[(tr2, op2, tr1, op1)]))
+            m.addConstr(u[(tr2, op_suc2)] + 1 <= u[(tr1, op1)] + M_u * (1 - z[(tr2, op2, tr1, op1)]) + M_u * (1 - y[(tr2, op2, op_suc2)]))
         m.addConstr(x[(tr1, op1)] >= z[(tr1, op1, tr2, op2)] + z[(tr2, op2, tr1, op1)]) # Zab+Zba is at most 1
         m.addConstr(x[(tr2, op2)] >= z[(tr1, op1, tr2, op2)] + z[(tr2, op2, tr1, op1)])
         m.addConstr(x[(tr1, op1)] + x[(tr2, op2)] - 1 <= z[(tr1, op1, tr2, op2)] + z[(tr2, op2, tr1, op1)]) # if both x are 1, it forces one of the z be 1
@@ -134,13 +147,13 @@ def parse(path):
         })
     return trains, objs, tr_ops, last_tr_ops
 
-def solve(path):
+def solve(path, out_path="solution_displib.json"):
     trains, objs, tr_ops, last_tr_ops = parse(path)
     tr_op_sucs = get_all_edges(tr_ops, trains)
     prev_ops = get_prev_ops(tr_ops, tr_op_sucs)
     m = gp.Model('DISPLIB_MILP')
     m.Params.OutputFlag = 0
-    M = get_big_m(trains)
+    H, M = get_big_m(trains)  # [AI] C: horizon H (upper bound of every t) and big-M
     M_u = len(tr_ops)
     t = m.addVars(tr_ops, vtype=GRB.INTEGER, name="time")
     x = m.addVars(tr_ops, vtype=GRB.BINARY, name="operation")
@@ -165,7 +178,9 @@ def solve(path):
         m.addConstr(yab <= xa)
         m.addConstr(yab <= xb)
         m.addConstr(xa+xb-1<=yab)
-        m.addConstr(t[(tr, suc)] >= t[(tr, op)] + trains[tr][op]['min_duration'] * yab)
+        # [AI] B: was  t[suc] >= t[op] + dur * y  -> with y = 0 it still forced t[suc] >= t[op],
+        # so an unused op (with its start_lb) pushed the op where the branches join
+        m.addConstr(t[(tr, suc)] >= t[(tr, op)] + trains[tr][op]['min_duration'] - M * (1 - yab))
         m.addConstr(u[(tr, op)] + 1 <= u[(tr, suc)] + M_u * (1 - y[(tr, op, suc)])) # if successive operation is next it has to be have order number more than previous
 
     # objective
@@ -177,8 +192,7 @@ def solve(path):
     # flow constraint (in-out) + time_constraint (start_lb <= time <= start_ub)
     for (tr, op) in tr_ops:
         t[(tr, op)].LB = trains[tr][op]['lb']
-        if trains[tr][op]['ub'] != INF:
-            t[(tr, op)].UB = trains[tr][op]['ub']
+        t[(tr, op)].UB = min(trains[tr][op]['ub'], H)  # [AI] C: every t inside the horizon, so M is valid
         if len(trains[tr][op]['sucs']) == 0 or len(prev_ops[(tr, op)]) == 0:
             continue
         prev = prev_ops[(tr, op)]
@@ -192,34 +206,38 @@ def solve(path):
     m.setObjective(gp.quicksum(w[i] for i in range(len(objs))), GRB.MINIMIZE)
 
 
-    m.Params.MIPGap = 0.05      # stop when proven within 5%
+    m.Params.MIPGap = 0         # [AI] C: was 0.05 (5 %); 0 = prove the real optimum
     m.Params.TimeLimit = 300    # only 300 seconds for run
+    m.Params.IntFeasTol = 1e-9  # [AI] C: default 1e-5 accepts z = 0.99999 as 1 -> M * 1e-5 seconds of hidden slack
     added = set()
+    # [AI] A: a pair already in `added` may come back (touching times are allowed) - that is normal.
+    # Only NEW pairs are added; when there are none, the solution is conflict-free.
     while True:
-        bug = False
         m.optimize()
         if m.Status == GRB.INFEASIBLE or m.SolCount == 0:
             print('🚨 ERROR: The model is mathematically impossible (Infeasible). Check your constraints!')
             break
         conflicts = detect_conflicts(tr_op_sucs, y, trains, t)
-        print(f'first solution goes with {len(conflicts)} conflicts')
+        new_conflicts = [c for c in conflicts if c not in added]
+        print(f'objective {m.ObjVal:.0f}: {len(conflicts)} pairs need an order, {len(new_conflicts)} of them new')
+        # a pair that is already in the model but really overlaps = model error (not just touching)
+        broken = [c for c in detect_conflicts(tr_op_sucs, y, trains, t, strict=True) if c in added]
+        if broken:
+            print(f'WARNING: {len(broken)} pairs already in the model still overlap, e.g. {broken[0]}')
         save_solution("solution.json", m, tr_ops, tr_op_sucs, x, y, t)
-        if len(conflicts) == 0:
-            print('found optimal solution')
+        save_displib_solution(out_path, m, trains, y, t, u)
+        if len(new_conflicts) == 0:
+            if m.Status == GRB.OPTIMAL:
+                print('found optimal solution')
+            else:
+                print('found feasible solution (time limit: optimality not proven)')
             break
-        for conflict in conflicts:
-            if conflict in added:
-                print('bug')
-                bug = True
-                break
-        if bug:
-            break
-        add_resource_constraints(conflicts, trains, m, t, x, z, u, M_u, M, tr_op_sucs, y)
-        added.update(conflicts) 
+        add_resource_constraints(new_conflicts, trains, m, t, x, z, u, M_u, M, tr_op_sucs, y)
+        added.update(new_conflicts)
         
 
 
 
 if __name__ == '__main__':
-    solve(sys.argv[1])
-    
+    # [AI] D: optional 2nd argument = output file in DISPLIB format (default solution_displib.json)
+    solve(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "solution_displib.json")
